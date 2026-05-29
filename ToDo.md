@@ -36,7 +36,7 @@ To run with a connected Arduino Mega (replace `/dev/ttyACM0` with your Arduino's
 - `status`: Shows current targets, calculated positions, and live motor step telemetry.
 - `stop`: Stops tracking and halts both motors immediately.
 - `lst`: Prints the current UTC and Local Sidereal Time.
-- `exit`: Shuts down the tracking and exits.
+- `exit`: Slews the telescope back to the Park/Home position (Az: 0°, Alt: 90°), halts motors, and closes the connection.
 
 ### 3. Flash the Arduino Mega
 Open the `mount_control/mount_control.ino` sketch in the Arduino IDE (or use the Arduino CLI) and flash it onto the Mega 2560.
