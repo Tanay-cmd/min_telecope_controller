@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import datetime
-from control_server import calculate_julian_date, calculate_lst, ra_dec_to_alt_az, map_target_to_physical_limits, steps_to_deg
+from server_control.telescope_controller import calculate_julian_date, calculate_lst, ra_dec_to_alt_az, map_target_to_physical_limits, steps_to_deg
 
 def run_tests():
     print("=== Running Coordinate Conversion Validation Tests ===")

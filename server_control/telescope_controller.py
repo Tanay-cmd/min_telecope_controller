@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
+import os
 import sys
+
+# Ensure parent directory of server_control is in sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import math
 import time
-import argparse
 import datetime
 import threading
-import socket
-from simbad_resolver import resolve_target_via_simbad
+from server_control.simbad_resolver import resolve_target_via_simbad
+
 try:
     import serial
 except ImportError:
@@ -31,9 +35,9 @@ STEPS_PER_REV = 2000  # DIP switches set on DM542
 AZ_GEAR_RATIO = -1.0  # Adjust if motor drives a gear/belt system (negative to reverse direction)
 ALT_GEAR_RATIO = 1.0  # Adjust if motor drives a gear/belt system
 
-# Calibration Reference Position (physical pointing at startup, step 0, 0)
-REF_ALT = 90.0  # Zenith
-REF_AZ = 0.0   # North
+# Calibration Reference Position default (physical pointing at startup, step 0, 0)
+DEFAULT_REF_ALT = 90.0  # Zenith
+DEFAULT_REF_AZ = 0.0   # North
 
 # Safety travel limits (in absolute degrees)
 # When calibration_mode is False, the telescope is restricted to these physical ranges:
@@ -118,7 +122,6 @@ def map_target_to_physical_limits(az_deg: float, alt_deg: float):
         
     return phys_az, phys_alt
 
-
 def deg_to_steps_relative(deg_target: float, deg_ref: float, gear_ratio: float, is_azimuth: bool = False) -> int:
     """Convert a target angle to motor steps relative to the calibration reference point."""
     delta = deg_target - deg_ref
@@ -134,6 +137,7 @@ def steps_to_deg(steps: float, deg_ref: float, gear_ratio: float, is_azimuth: bo
         # Normalize to range [-180, 180] relative to North (0)
         deg = (deg + 180.0) % 360.0 - 180.0
     return deg
+
 
 class TelescopeController:
     def __init__(self, port, baud=9600, lat=DEFAULT_LATITUDE, lon=DEFAULT_LONGITUDE, elevation=DEFAULT_ELEVATION):
@@ -154,6 +158,8 @@ class TelescopeController:
         self.target_alt_steps = 0
         self.is_parked = False
         self.calibration_mode = False  # Safety limits enforced initially
+        self.ref_az = DEFAULT_REF_AZ
+        self.ref_alt = DEFAULT_REF_ALT
 
     def set_calibration_mode(self, enabled: bool):
         """Thread-safely toggle calibration mode."""
@@ -166,7 +172,7 @@ class TelescopeController:
         if self.serial_port == "MOCK":
             print("[INFO] Running in MOCK Serial Mode.")
             try:
-                import joystick_control
+                import server_control.joystick_control as joystick_control
                 joystick_control.start_joystick_thread(self)
             except ImportError:
                 print("[WARNING] joystick_control.py module not found. Joystick control disabled.")
@@ -187,7 +193,7 @@ class TelescopeController:
             print("[BOOT] Auto-aligning: Slewing telescope back to calibrated Home position (0, 0)...")
             self.send_command("MOVE 0 0")
             try:
-                import joystick_control
+                import server_control.joystick_control as joystick_control
                 joystick_control.start_joystick_thread(self)
             except ImportError:
                 print("[WARNING] joystick_control.py module not found. Joystick control disabled.")
@@ -203,7 +209,6 @@ class TelescopeController:
             print(f"[MOCK SEND] {cmd.strip()}")
 
     def _read_telemetry(self):
-        global REF_AZ, REF_ALT
         while self.ser and self.ser.is_open:
             try:
                 if self.ser.in_waiting > 0:
@@ -221,9 +226,9 @@ class TelescopeController:
                             parts = line.split()
                             if len(parts) >= 3:
                                 try:
-                                    REF_AZ = float(parts[1])
-                                    REF_ALT = float(parts[2])
-                                    print(f"\n[INFO] Loaded reference coordinates from Arduino: Az={REF_AZ}°, Alt={REF_ALT}°\nControl CLI> ", end="", flush=True)
+                                    self.ref_az = float(parts[1])
+                                    self.ref_alt = float(parts[2])
+                                    print(f"\n[INFO] Loaded reference coordinates from Arduino: Az={self.ref_az}°, Alt={self.ref_alt}°\nControl CLI> ", end="", flush=True)
                                 except ValueError:
                                     pass
                         else:
@@ -248,8 +253,8 @@ class TelescopeController:
                 # Map coordinates to safety limits (flip if needed)
                 phys_az, phys_alt = map_target_to_physical_limits(az, alt)
                 
-                az_steps = deg_to_steps_relative(phys_az, REF_AZ, AZ_GEAR_RATIO, is_azimuth=True)
-                alt_steps = deg_to_steps_relative(phys_alt, REF_ALT, ALT_GEAR_RATIO, is_azimuth=False)
+                az_steps = deg_to_steps_relative(phys_az, self.ref_az, AZ_GEAR_RATIO, is_azimuth=True)
+                alt_steps = deg_to_steps_relative(phys_alt, self.ref_alt, ALT_GEAR_RATIO, is_azimuth=False)
                 
                 # Enforce safety limits if NOT in calibration mode
                 if not self.calibration_mode:
@@ -282,8 +287,8 @@ class TelescopeController:
                 # Map coordinates to safety limits (flip if needed)
                 phys_az, phys_alt = map_target_to_physical_limits(az, alt)
                 
-                az_steps = deg_to_steps_relative(phys_az, REF_AZ, AZ_GEAR_RATIO, is_azimuth=True)
-                alt_steps = deg_to_steps_relative(phys_alt, REF_ALT, ALT_GEAR_RATIO, is_azimuth=False)
+                az_steps = deg_to_steps_relative(phys_az, self.ref_az, AZ_GEAR_RATIO, is_azimuth=True)
+                alt_steps = deg_to_steps_relative(phys_alt, self.ref_alt, ALT_GEAR_RATIO, is_azimuth=False)
                 
                 # Enforce safety limits if NOT in calibration mode
                 if not self.calibration_mode:
@@ -303,15 +308,14 @@ class TelescopeController:
 
     def set_position(self, az_str: str, alt_str: str):
         """Calibrate the telescope reference coordinates to the given Alt-Az in degrees at the current physical position."""
-        global REF_AZ, REF_ALT
         with self.lock:
             try:
                 az = float(az_str)
                 alt = float(alt_str)
                 
-                # Update global reference coordinates
-                REF_AZ = az
-                REF_ALT = alt
+                # Update reference coordinates
+                self.ref_az = az
+                self.ref_alt = alt
                 
                 # Reset current step counts to 0, 0 since this physical position is the new reference
                 self.current_az_steps = 0
@@ -339,8 +343,8 @@ class TelescopeController:
                 
                 # Enforce safety limits if NOT in calibration mode
                 if not self.calibration_mode:
-                    az_deg = steps_to_deg(az_steps, REF_AZ, AZ_GEAR_RATIO, is_azimuth=True)
-                    alt_deg = steps_to_deg(alt_steps, REF_ALT, ALT_GEAR_RATIO, is_azimuth=False)
+                    az_deg = steps_to_deg(az_steps, self.ref_az, AZ_GEAR_RATIO, is_azimuth=True)
+                    alt_deg = steps_to_deg(alt_steps, self.ref_alt, ALT_GEAR_RATIO, is_azimuth=False)
                     if az_deg < AZ_LIMIT_MIN_DEG or az_deg > AZ_LIMIT_MAX_DEG or alt_deg < ALT_LIMIT_MIN_DEG or alt_deg > ALT_LIMIT_MAX_DEG:
                         print(f"[ERROR] Target steps correspond to Az: {az_deg:.2f}°, Alt: {alt_deg:.2f}° which exceed physical safety limits (Az: {AZ_LIMIT_MIN_DEG}° to {AZ_LIMIT_MAX_DEG}°, Alt: {ALT_LIMIT_MIN_DEG}° to {ALT_LIMIT_MAX_DEG}°).")
                         return False
@@ -372,17 +376,17 @@ class TelescopeController:
                 
                 # Enforce safety limits if NOT in calibration mode
                 if not self.calibration_mode:
-                    new_az_deg = steps_to_deg(new_az, REF_AZ, AZ_GEAR_RATIO, is_azimuth=True)
-                    new_alt_deg = steps_to_deg(new_alt, REF_ALT, ALT_GEAR_RATIO, is_azimuth=False)
+                    new_az_deg = steps_to_deg(new_az, self.ref_az, AZ_GEAR_RATIO, is_azimuth=True)
+                    new_alt_deg = steps_to_deg(new_alt, self.ref_alt, ALT_GEAR_RATIO, is_azimuth=False)
                     
                     if new_az_deg < AZ_LIMIT_MIN_DEG or new_az_deg > AZ_LIMIT_MAX_DEG:
                         clamped_az_deg = max(AZ_LIMIT_MIN_DEG, min(AZ_LIMIT_MAX_DEG, new_az_deg))
-                        new_az = deg_to_steps_relative(clamped_az_deg, REF_AZ, AZ_GEAR_RATIO, is_azimuth=True)
+                        new_az = deg_to_steps_relative(clamped_az_deg, self.ref_az, AZ_GEAR_RATIO, is_azimuth=True)
                         print(f"\n[WARNING] Azimuth safety limit reached ({clamped_az_deg:.1f}°). Clamping movement to {new_az} steps.\nControl CLI> ", end="", flush=True)
                         
                     if new_alt_deg < ALT_LIMIT_MIN_DEG or new_alt_deg > ALT_LIMIT_MAX_DEG:
                         clamped_alt_deg = max(ALT_LIMIT_MIN_DEG, min(ALT_LIMIT_MAX_DEG, new_alt_deg))
-                        new_alt = deg_to_steps_relative(clamped_alt_deg, REF_ALT, ALT_GEAR_RATIO, is_azimuth=False)
+                        new_alt = deg_to_steps_relative(clamped_alt_deg, self.ref_alt, ALT_GEAR_RATIO, is_azimuth=False)
                         print(f"\n[WARNING] Altitude safety limit reached ({clamped_alt_deg:.1f}°). Clamping movement to {new_alt} steps.\nControl CLI> ", end="", flush=True)
                 
                 self.target_az_steps = new_az
@@ -415,8 +419,6 @@ class TelescopeController:
                 print("[ERROR] Nudge RA/Dec offsets must be floats.")
                 return False
 
-
-
     def start_tracking(self):
         with self.lock:
             if self.target_ra is None or self.target_dec is None:
@@ -447,7 +449,7 @@ class TelescopeController:
             self.target_ra = None
             self.target_dec = None
             
-        print(f"\n[PARK] Returning telescope to Calibrated Home position (Az: {REF_AZ:.2f}°, Alt: {REF_ALT:.2f}°)...")
+        print(f"\n[PARK] Returning telescope to Calibrated Home position (Az: {self.ref_az:.2f}°, Alt: {self.ref_alt:.2f}°)...")
         self.send_command("MOVE 0 0")
         
         # Wait until current steps match 0, 0
@@ -495,8 +497,8 @@ class TelescopeController:
             # Map coordinates to safety limits (flip if needed)
             phys_az, phys_alt = map_target_to_physical_limits(az, alt)
             
-            az_steps = deg_to_steps_relative(phys_az, REF_AZ, AZ_GEAR_RATIO, is_azimuth=True)
-            alt_steps = deg_to_steps_relative(phys_alt, REF_ALT, ALT_GEAR_RATIO, is_azimuth=False)
+            az_steps = deg_to_steps_relative(phys_az, self.ref_az, AZ_GEAR_RATIO, is_azimuth=True)
+            alt_steps = deg_to_steps_relative(phys_alt, self.ref_alt, ALT_GEAR_RATIO, is_azimuth=False)
             
             # Enforce safety limits if NOT in calibration mode
             if not self.calibration_mode:
@@ -516,160 +518,3 @@ class TelescopeController:
             
             # Update every 2 seconds
             time.sleep(2.0)
-
-def main():
-    parser = argparse.ArgumentParser(description="Telescope Alt-Az Mount Tracking Control Server")
-    parser.add_argument("--port", type=str, default="MOCK", help="Serial port of Arduino Mega (e.g. /dev/ttyACM0). Use 'MOCK' for test run.")
-    parser.add_argument("--lat", type=float, default=DEFAULT_LATITUDE, help=f"Observer latitude in degrees (default: {DEFAULT_LATITUDE})")
-    parser.add_argument("--lon", type=float, default=DEFAULT_LONGITUDE, help=f"Observer longitude in degrees (default: {DEFAULT_LONGITUDE})")
-    parser.add_argument("--elevation", type=float, default=DEFAULT_ELEVATION, help=f"Observer elevation in meters (default: {DEFAULT_ELEVATION})")
-    
-    args = parser.parse_args()
-    
-    print("====================================================")
-    print("   Telescope Mount Alt-Az Tracking Server Started   ")
-    print(f"   Location: Lat={args.lat:.4f}°, Lon={args.lon:.4f}°, Elev={args.elevation:.1f}m")
-    print("====================================================")
-    
-    controller = TelescopeController(port=args.port, lat=args.lat, lon=args.lon, elevation=args.elevation)
-    if not controller.connect():
-        sys.exit(1)
-        
-    print("\nCommands available:")
-    print("  target <RA> <Dec>           - Set target coordinates and slew immediately")
-    print("  target resolve <ObjectName> - Resolve coordinates via Simbad and slew immediately")
-    print("  goto <Az> <Alt>             - Slew directly to Alt-Az in degrees (e.g., 'goto 180 45')")
-    print("  set_pos <Az> <Alt>  - Calibrate current position to Alt-Az degrees (without moving)")
-    print("  pulse <Az> <Alt>    - Command raw step pulses directly (e.g., 'pulse 333 0')")
-    print("  nudge_steps <X> <Y> - Nudge current motor step targets relatively")
-    print("  nudge_ra_dec <H> <D>- Nudge tracking target RA hours and Dec degrees relatively")
-    print("  track               - Start continuous Alt-Az tracking loop")
-    print("  status              - Show current targets, calculated positions, and motor telemetry")
-    print("  stop                - Stop tracking and halt motors")
-    print("  calibrate on/off    - Toggle calibration mode (bypasses safety limits when on)")
-    print("  exit                - Close program")
-    print("  lst                 - Calculate and print current LST")
-    
-    try:
-        while True:
-            cmd_line = input("\nControl CLI> ").strip()
-            if not cmd_line:
-                continue
-            
-            parts = cmd_line.split()
-            cmd = parts[0].lower()
-            
-            if cmd == "exit":
-                controller.park_and_shutdown()
-                break
-            elif cmd == "lst":
-                now = datetime.datetime.now(datetime.timezone.utc)
-                lst = calculate_lst(args.lon, now)
-                lst_h = int(lst)
-                lst_m = int((lst - lst_h) * 60)
-                lst_s = int(((lst - lst_h) * 60 - lst_m) * 60)
-                print(f"Current UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-                print(f"Current LST: {lst_h:02d}:{lst_m:02d}:{lst_s:02d} ({lst:.4f} hours)")
-            elif cmd == "status":
-                now = datetime.datetime.now(datetime.timezone.utc)
-                lst = calculate_lst(args.lon, now)
-                lst_h = int(lst)
-                lst_m = int((lst - lst_h) * 60)
-                lst_s = int(((lst - lst_h) * 60 - lst_m) * 60)
-                lst_str = f"{lst_h:02d}:{lst_m:02d}:{lst_s:02d}"
-                
-                print("----------------------------------------------------")
-                print(f"System Time:    UTC {now.strftime('%Y-%m-%d %H:%M:%S')} | LST {lst_str}")
-                with controller.lock:
-                    ra = controller.target_ra
-                    dec = controller.target_dec
-                    tracking = controller.tracking
-                
-                if ra is not None and dec is not None:
-                    alt, az, _ = ra_dec_to_alt_az(ra, dec, args.lat, args.lon, args.elevation, now)
-                    print(f"Target Object:  RA {ra:.4f}h | Dec {dec:.4f}°")
-                    print(f"Target Alt/Az:  Alt {alt:.2f}° | Az {az:.2f}°")
-                    print(f"Target Steps:   Az {controller.target_az_steps} | Alt {controller.target_alt_steps}")
-                else:
-                    print("Target Object:  None Set")
-                
-                cur_az_deg = steps_to_deg(controller.current_az_steps, REF_AZ, AZ_GEAR_RATIO, is_azimuth=True)
-                cur_alt_deg = steps_to_deg(controller.current_alt_steps, REF_ALT, ALT_GEAR_RATIO, is_azimuth=False)
-                print(f"Mount Alt/Az:   Alt {cur_alt_deg:.2f}° | Az {cur_az_deg:.2f}°")
-                print(f"Motor Steps:    Az {controller.current_az_steps} | Alt {controller.current_alt_steps}")
-                print(f"Tracking State: {'ACTIVE' if tracking else 'INACTIVE'}")
-                print("----------------------------------------------------")
-            elif cmd == "target":
-                if len(parts) >= 2 and parts[1].lower() == "resolve":
-                    if len(parts) < 3:
-                        print("Usage: target resolve <ObjectName>   (e.g., target resolve M42)")
-                        continue
-                    object_name = " ".join(parts[2:])
-                    print(f"Resolving '{object_name}' via Simbad...")
-                    res = resolve_target_via_simbad(object_name)
-                    if res:
-                        ra_d = res.get('ra_d') or res.get('ra')
-                        dec_d = res.get('dec_d') or res.get('dec')
-                        name = res.get('name') or object_name
-                        if ra_d is not None and dec_d is not None:
-                            ra_h = ra_d / 15.0
-                            print(f"[SIMBAD] Resolved '{name}' to RA: {ra_h:.4f}h ({ra_d:.4f}°), Dec: {dec_d:.4f}°")
-                            controller.set_target(str(ra_h), str(dec_d))
-                        else:
-                            print(f"[ERROR] Resolved object '{name}' is missing coordinates.")
-                    else:
-                        print(f"[ERROR] Could not resolve '{object_name}' via Simbad.")
-                else:
-                    if len(parts) < 3:
-                        print("Usage: target <RA> <Dec>   (e.g., target 05:35:17 -05:23:28 or target 5.588 -5.391)")
-                        print("       To resolve via Simbad: target resolve <ObjectName> (e.g., target resolve M42)")
-                        continue
-                    controller.set_target(parts[1], parts[2])
-            elif cmd == "goto":
-                if len(parts) < 2:
-                    print("Usage: goto <Az> [Alt]   (e.g., goto 180 or goto 180 45, default Alt is 90)")
-                    continue
-                alt_val = parts[2] if len(parts) >= 3 else "90.0"
-                controller.slew_to_alt_az(parts[1], alt_val)
-            elif cmd == "set_pos":
-                if len(parts) < 3:
-                    print("Usage: set_pos <Az> <Alt>   (e.g., set_pos 180 90)")
-                    continue
-                controller.set_position(parts[1], parts[2])
-            elif cmd == "pulse":
-                if len(parts) < 3:
-                    print("Usage: pulse <Az_pulses> <Alt_pulses>   (e.g., pulse 333 0)")
-                    continue
-                controller.send_raw_pulses(parts[1], parts[2])
-            elif cmd == "nudge_steps":
-                if len(parts) < 3:
-                    print("Usage: nudge_steps <d_az> <d_alt>   (e.g., nudge_steps 100 -50)")
-                    continue
-                controller.nudge_steps(parts[1], parts[2])
-            elif cmd == "nudge_ra_dec":
-                if len(parts) < 3:
-                    print("Usage: nudge_ra_dec <d_ra> <d_dec>   (e.g., nudge_ra_dec 0.05 0.5)")
-                    continue
-                controller.nudge_ra_dec(parts[1], parts[2])
-            elif cmd == "calibrate":
-                if len(parts) < 2:
-                    print("Usage: calibrate <on|off>")
-                    continue
-                arg = parts[1].lower()
-                if arg == "on":
-                    controller.set_calibration_mode(True)
-                elif arg == "off":
-                    controller.set_calibration_mode(False)
-                else:
-                    print("Invalid argument. Use: calibrate on or calibrate off")
-            elif cmd == "stop":
-                controller.stop_tracking()
-            else:
-                print(f"Unknown command: '{cmd}'. Available: target, goto, set_pos, pulse, nudge_steps, nudge_ra_dec, track, status, stop, lst, exit.")
-    except KeyboardInterrupt:
-        print("\nExiting...")
-    finally:
-        controller.park_and_shutdown()
-
-if __name__ == "__main__":
-    main()
